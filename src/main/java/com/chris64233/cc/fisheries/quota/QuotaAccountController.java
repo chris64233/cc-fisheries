@@ -22,9 +22,12 @@ import org.springframework.web.bind.annotation.RestController;
 public class QuotaAccountController {
 
     private final QuotaAccountService accountService;
+    private final FreezeQueryService freezeQueryService;
 
-    public QuotaAccountController(QuotaAccountService accountService) {
+    public QuotaAccountController(QuotaAccountService accountService,
+                                  FreezeQueryService freezeQueryService) {
         this.accountService = accountService;
+        this.freezeQueryService = freezeQueryService;
     }
 
     public record CreateAccountRequest(
@@ -35,10 +38,18 @@ public class QuotaAccountController {
     }
 
     public record AccountResponse(Long id, String season, String species, String holder,
-                                  BigDecimal available, BigDecimal frozen, BigDecimal consumed) {
+                                  BigDecimal available, BigDecimal frozen, BigDecimal consumed,
+                                  long version) {
         static AccountResponse from(QuotaAccount account) {
             return new AccountResponse(account.getId(), account.getSeason(), account.getSpecies(),
-                    account.getHolder(), account.getAvailable(), account.getFrozen(), account.getConsumed());
+                    account.getHolder(), account.getAvailable(), account.getFrozen(), account.getConsumed(),
+                    account.getVersion());
+        }
+    }
+
+    public record FreezeResponse(String type, String ref, BigDecimal quantity, String detail) {
+        static FreezeResponse from(FreezeDetail detail) {
+            return new FreezeResponse(detail.type(), detail.ref(), detail.quantity(), detail.detail());
         }
     }
 
@@ -73,5 +84,10 @@ public class QuotaAccountController {
     @GetMapping("/{id}/ledger")
     public List<LedgerEventResponse> ledger(@PathVariable Long id) {
         return accountService.getLedger(id).stream().map(LedgerEventResponse::from).toList();
+    }
+
+    @GetMapping("/{id}/freezes")
+    public List<FreezeResponse> freezes(@PathVariable Long id) {
+        return freezeQueryService.listFreezes(id).stream().map(FreezeResponse::from).toList();
     }
 }
