@@ -39,4 +39,14 @@ public final class Quantities {
         }
         return normalized;
     }
+
+    /**
+     * 业务号/操作人等文本必填，去掉空白后不能为空。
+     */
+    public static String requireText(String value, String field) {
+        if (value == null || value.isBlank()) {
+            throw new BusinessException(HttpStatus.BAD_REQUEST, field + " 不能为空");
+        }
+        return value;
+    }
 }

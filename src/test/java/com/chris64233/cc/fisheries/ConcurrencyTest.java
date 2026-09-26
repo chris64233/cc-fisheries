@@ -14,6 +14,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import com.chris64233.cc.fisheries.common.BusinessException;
+import com.chris64233.cc.fisheries.correction.CorrectionService;
+import com.chris64233.cc.fisheries.hold.HoldStatus;
 import com.chris64233.cc.fisheries.landing.LandingService;
 import com.chris64233.cc.fisheries.quota.LedgerEventType;
 import com.chris64233.cc.fisheries.quota.LedgerEventRepository;
@@ -29,29 +31,27 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 
 /**
- * 并发场景：接受、释放、卸港同时发生时，三个余额必须守恒，
- * 不允许超转、超捕或重复释放。
+ * 并发场景：转让接受、卸港申报/确认、更正确认同时发生时，三个余额必须守恒，
+ * 任何时刻账户不得为负，且不允许超转、超捕或重复核销/归还。
  */
 @SpringBootTest
 class ConcurrencyTest {
 
     @Autowired
     QuotaAccountService accountService;
-
     @Autowired
     TransferService transferService;
-
     @Autowired
     LandingService landingService;
-
+    @Autowired
+    CorrectionService correctionService;
     @Autowired
     QuotaAccountRepository accountRepository;
-
     @Autowired
     LedgerEventRepository ledgerRepository;
 
     @Test
-    void concurrentLandingsNeverOverConsume() throws Exception {
+    void concurrentDeclaresNeverOverFreeze() throws Exception {
         QuotaAccount account = accountService.createAccount("C1", "COD", "A", new BigDecimal("100"));
         int threads = 20;
         AtomicInteger succeeded = new AtomicInteger();
@@ -61,21 +61,23 @@ class ConcurrencyTest {
                 landingService.declare("C1-EVT-" + i, "V" + i, "A", "COD", "C1", new BigDecimal("10"));
                 succeeded.incrementAndGet();
             } catch (BusinessException expected) {
-                // 配额不足，核销失败
+                // 可用不足，冻结失败
             }
         });
 
         QuotaAccount after = accountService.getAccount(account.getId());
         assertThat(succeeded.get()).isEqualTo(10);
         assertThat(after.getAvailable()).isEqualByComparingTo("0");
-        assertThat(after.getConsumed()).isEqualByComparingTo("100");
+        assertThat(after.getFrozen()).isEqualByComparingTo("100");
+        assertThat(after.getConsumed()).isEqualByComparingTo("0");
         assertThat(after.total()).isEqualByComparingTo("100");
-        assertThat(ledgerRepository.countByAccountIdAndType(account.getId(), LedgerEventType.LANDING_DEDUCT))
+        assertThat(ledgerRepository.countByAccountIdAndType(account.getId(), LedgerEventType.LANDING_FREEZE))
                 .isEqualTo(10);
+        assertHeldHoldsEqualFrozen(account.getId());
     }
 
     @Test
-    void concurrentDuplicateEventDeductsOnlyOnce() throws Exception {
+    void concurrentDuplicateDeclareFreezesOnlyOnce() throws Exception {
         QuotaAccount account = accountService.createAccount("C2", "COD", "A", new BigDecimal("100"));
         AtomicInteger succeeded = new AtomicInteger();
 
@@ -86,9 +88,24 @@ class ConcurrencyTest {
 
         QuotaAccount after = accountService.getAccount(account.getId());
         assertThat(succeeded.get()).isEqualTo(10);
-        assertThat(after.getConsumed()).isEqualByComparingTo("10");
+        assertThat(after.getConsumed()).isEqualByComparingTo("0");
+        assertThat(after.getFrozen()).isEqualByComparingTo("10");
         assertThat(after.getAvailable()).isEqualByComparingTo("90");
-        assertThat(ledgerRepository.countByAccountIdAndType(account.getId(), LedgerEventType.LANDING_DEDUCT))
+        assertThat(ledgerRepository.countByAccountIdAndType(account.getId(), LedgerEventType.LANDING_FREEZE))
+                .isEqualTo(1);
+    }
+
+    @Test
+    void concurrentDuplicateLandingReviewSettlesOnlyOnce() throws Exception {
+        QuotaAccount account = accountService.createAccount("C2B", "COD", "A", new BigDecimal("100"));
+        landingService.declare("C2B-EVT", "V1", "A", "COD", "C2B", new BigDecimal("10"));
+
+        runConcurrently(12, i -> landingService.confirm("C2B-EVT", "C2B-REV", "port-1"));
+
+        QuotaAccount after = accountService.getAccount(account.getId());
+        assertThat(after.getFrozen()).isEqualByComparingTo("0");
+        assertThat(after.getConsumed()).isEqualByComparingTo("10");
+        assertThat(ledgerRepository.countByAccountIdAndType(account.getId(), LedgerEventType.LANDING_CONSUME))
                 .isEqualTo(1);
     }
 
@@ -122,37 +139,99 @@ class ConcurrencyTest {
         assertThat(after.getFrozen()).isEqualByComparingTo("0");
         assertThat(ledgerRepository.countByAccountIdAndType(account.getId(), LedgerEventType.TRANSFER_RELEASE))
                 .isEqualTo(1);
+        assertHeldHoldsEqualFrozen(account.getId());
         assertThat(transferService.getTransfer(transfer.getId()).getStatus())
                 .isIn(TransferStatus.REJECTED, TransferStatus.EXPIRED);
     }
 
     @Test
-    void concurrentAcceptAndLandingConserveBalances() throws Exception {
-        QuotaAccount from = accountService.createAccount("C4", "COD", "A", new BigDecimal("100"));
-        QuotaAccount to = accountService.createAccount("C4", "COD", "B", new BigDecimal("0.001"));
+    void concurrentAcceptLandingConfirmAndCorrectionConfirmNeverGoNegative() throws Exception {
+        // A 初始 110：转让冻结 40、卸港待复核冻结 30、增重更正冻结 20，剩可用 20（确认基础卸港后）
+        QuotaAccount a = accountService.createAccount("C4", "COD", "A", new BigDecimal("110"));
+        QuotaAccount b = accountService.createAccount("C4", "COD", "B", new BigDecimal("0.001"));
         Transfer transfer = transferService.initiate("C4", "COD", "A", "B", new BigDecimal("40"), null);
+        landingService.declare("C4-LAND", "V1", "A", "COD", "C4", new BigDecimal("30"));
+        // 先有一笔已核销申报 20，再挂一笔增重 +20 的待确认更正
+        landingService.declare("C4-BASE", "V1", "A", "COD", "C4", new BigDecimal("20"));
+        landingService.confirm("C4-BASE", "C4-BASE-REV", "port-1");
+        correctionService.create("C4-CORR", "C4-BASE", new BigDecimal("40"));
 
+        AtomicInteger correctionRejected = new AtomicInteger();
+        runConcurrently(3, i -> {
+            try {
+                switch (i) {
+                    case 0 -> transferService.accept(transfer.getId());
+                    case 1 -> landingService.confirm("C4-LAND", "C4-LAND-REV", "port-1");
+                    default -> correctionService.confirm("C4-CORR", "C4-CORR-REV", "port-2");
+                }
+            } catch (BusinessException ex) {
+                // 更正确认时账户版本已被其它两个决策推进：旧决定必须被拒绝，且不写入部分差额
+                correctionRejected.incrementAndGet();
+            }
+        });
+
+        QuotaAccount aAfter = accountService.getAccount(a.getId());
+        QuotaAccount bAfter = accountService.getAccount(b.getId());
+        assertThat(aAfter.hasNegativeBalance()).isFalse();
+        assertThat(bAfter.hasNegativeBalance()).isFalse();
+        // 转让接受、卸港确认不依赖账户版本，必然成功
+        assertThat(transferService.getTransfer(transfer.getId()).getStatus()).isEqualTo(TransferStatus.ACCEPTED);
+        assertThat(landingService.getByEventId("C4-LAND").getStatus().name()).isEqualTo("CONFIRMED");
+        assertThat(bAfter.getAvailable()).isEqualByComparingTo("40.001");
+
+        long correctionConsumeEvents = ledgerRepository.findByAccountIdAndReferenceOrderByIdAsc(
+                        a.getId(), "C4-CORR").stream()
+                .filter(e -> e.getType() == LedgerEventType.CORRECTION_CONSUME).count();
+        if (correctionRejected.get() > 0) {
+            // 更正旧决定被拒：保持 PENDING，冻结仍在，差额未核销、未归还
+            assertThat(correctionService.getByCorrectionId("C4-CORR").getStatus().name())
+                    .isEqualTo("PENDING");
+            assertThat(correctionConsumeEvents).isZero();
+            // A：可用 0、更正冻结 20、已核销 50（基础20+卸港30）
+            assertThat(aAfter.getFrozen()).isEqualByComparingTo("20");
+            assertThat(aAfter.getConsumed()).isEqualByComparingTo("50");
+        } else {
+            // 更正抢到锁先执行：全部结算
+            assertThat(correctionService.getByCorrectionId("C4-CORR").getStatus().name())
+                    .isEqualTo("CONFIRMED");
+            assertThat(aAfter.getFrozen()).isEqualByComparingTo("0");
+            assertThat(aAfter.getConsumed()).isEqualByComparingTo("70");
+        }
+        // 任何顺序下总量守恒：两账户合计仍为初始核准总量
+        assertThat(aAfter.total().add(bAfter.total())).isEqualByComparingTo("110.001");
+        assertHeldHoldsEqualFrozen(a.getId());
+    }
+
+    @Test
+    void concurrentAcceptAndDeclareCompeteForAvailableWithoutGoingNegative() throws Exception {
+        QuotaAccount from = accountService.createAccount("C6", "COD", "A", new BigDecimal("100"));
+        accountService.createAccount("C6", "COD", "B", new BigDecimal("0.001"));
+        Transfer transfer = transferService.initiate("C6", "COD", "A", "B", new BigDecimal("40"), null);
+
+        AtomicInteger declared = new AtomicInteger();
         runConcurrently(11, i -> {
             try {
                 if (i == 0) {
                     transferService.accept(transfer.getId());
                 } else {
-                    landingService.declare("C4-EVT-" + i, "V" + i, "A", "COD", "C4", new BigDecimal("10"));
+                    landingService.declare("C6-EVT-" + i, "V" + i, "A", "COD", "C6", new BigDecimal("10"));
+                    declared.incrementAndGet();
                 }
             } catch (BusinessException expected) {
-                // 配额不足时核销失败属正常竞争结果
+                // 可用不足时冻结失败属正常竞争结果
             }
         });
 
         QuotaAccount fromAfter = accountService.getAccount(from.getId());
-        QuotaAccount toAfter = accountService.getAccount(to.getId());
         assertThat(transferService.getTransfer(transfer.getId()).getStatus()).isEqualTo(TransferStatus.ACCEPTED);
-        assertThat(fromAfter.getFrozen()).isEqualByComparingTo("0");
         assertThat(fromAfter.hasNegativeBalance()).isFalse();
-        assertThat(toAfter.hasNegativeBalance()).isFalse();
-        // 总量守恒：两个账户合计仍等于初始核准总量
-        assertThat(fromAfter.total().add(toAfter.total())).isEqualByComparingTo("100.001");
-        assertThat(toAfter.getAvailable()).isEqualByComparingTo("40.001");
+        // 接受后 A 总量 60（40 已转出），最多再冻结 6 笔 10
+        assertThat(declared.get()).isLessThanOrEqualTo(6);
+        assertThat(fromAfter.getAvailable())
+                .isEqualByComparingTo(new BigDecimal("60").subtract(new BigDecimal(declared.get() * 10)));
+        assertThat(fromAfter.getFrozen()).isEqualByComparingTo(new BigDecimal(declared.get() * 10));
+        assertThat(fromAfter.total()).isEqualByComparingTo("60");
+        assertHeldHoldsEqualFrozen(from.getId());
     }
 
     @Test
@@ -175,6 +254,18 @@ class ConcurrencyTest {
         assertThat(after.getFrozen()).isEqualByComparingTo("90");
         assertThat(after.getAvailable()).isEqualByComparingTo("10");
         assertThat(after.total()).isEqualByComparingTo("100");
+        assertHeldHoldsEqualFrozen(account.getId());
+    }
+
+    private void assertHeldHoldsEqualFrozen(Long accountId) {
+        QuotaAccount snapshot = accountService.getAccount(accountId);
+        BigDecimal heldSum = accountService.getHolds(accountId, true).stream()
+                .map(h -> h.getQuantity())
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+        assertThat(heldSum).isEqualByComparingTo(snapshot.getFrozen());
+        // 所有持有中明细状态正确
+        assertThat(accountService.getHolds(accountId, true))
+                .allMatch(h -> h.getStatus() == HoldStatus.HELD);
     }
 
     private void runConcurrently(int threads, ThrowingTask task) throws Exception {

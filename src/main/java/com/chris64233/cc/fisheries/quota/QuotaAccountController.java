@@ -3,6 +3,8 @@ package com.chris64233.cc.fisheries.quota;
 import java.math.BigDecimal;
 import java.util.List;
 
+import com.chris64233.cc.fisheries.hold.QuotaHold;
+
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
@@ -35,10 +37,12 @@ public class QuotaAccountController {
     }
 
     public record AccountResponse(Long id, String season, String species, String holder,
-                                  BigDecimal available, BigDecimal frozen, BigDecimal consumed) {
+                                  BigDecimal available, BigDecimal frozen, BigDecimal consumed,
+                                  long version) {
         static AccountResponse from(QuotaAccount account) {
             return new AccountResponse(account.getId(), account.getSeason(), account.getSpecies(),
-                    account.getHolder(), account.getAvailable(), account.getFrozen(), account.getConsumed());
+                    account.getHolder(), account.getAvailable(), account.getFrozen(), account.getConsumed(),
+                    account.getVersion());
         }
     }
 
@@ -49,6 +53,16 @@ public class QuotaAccountController {
             return new LedgerEventResponse(event.getId(), event.getAccountId(), event.getType().name(),
                     event.getQuantity(), event.getAvailableAfter(), event.getFrozenAfter(),
                     event.getConsumedAfter(), event.getReference(), event.getOccurredAt().toString());
+        }
+    }
+
+    public record HoldResponse(Long id, Long accountId, String holdType, String referenceId,
+                               BigDecimal quantity, String status, String createdAt, String resolvedAt) {
+        static HoldResponse from(QuotaHold hold) {
+            return new HoldResponse(hold.getId(), hold.getAccountId(), hold.getHoldType().name(),
+                    hold.getReferenceId(), hold.getQuantity(), hold.getStatus().name(),
+                    hold.getCreatedAt().toString(),
+                    hold.getResolvedAt() == null ? null : hold.getResolvedAt().toString());
         }
     }
 
@@ -71,7 +85,17 @@ public class QuotaAccountController {
     }
 
     @GetMapping("/{id}/ledger")
-    public List<LedgerEventResponse> ledger(@PathVariable Long id) {
-        return accountService.getLedger(id).stream().map(LedgerEventResponse::from).toList();
+    public List<LedgerEventResponse> ledger(@PathVariable Long id,
+                                            @RequestParam(required = false) String reference) {
+        List<LedgerEvent> events = reference == null
+                ? accountService.getLedger(id)
+                : accountService.getLedgerByReference(id, reference);
+        return events.stream().map(LedgerEventResponse::from).toList();
+    }
+
+    @GetMapping("/{id}/holds")
+    public List<HoldResponse> holds(@PathVariable Long id,
+                                    @RequestParam(required = false) Boolean activeOnly) {
+        return accountService.getHolds(id, activeOnly).stream().map(HoldResponse::from).toList();
     }
 }

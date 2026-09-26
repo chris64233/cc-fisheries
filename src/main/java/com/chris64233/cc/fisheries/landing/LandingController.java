@@ -37,12 +37,22 @@ public class LandingController {
             @NotNull @Positive BigDecimal weight) {
     }
 
+    public record ReviewRequest(
+            @NotBlank String reviewEventId,
+            @NotBlank String reviewer) {
+    }
+
     public record LandingResponse(Long id, String eventId, String vessel, String holder, String species,
-                                  String season, BigDecimal weight, String recordedAt) {
+                                  String season, BigDecimal weight, BigDecimal confirmedWeight,
+                                  String status, long version, String reviewer,
+                                  String recordedAt, String confirmedAt, String rejectedAt) {
         static LandingResponse from(LandingRecord record) {
             return new LandingResponse(record.getId(), record.getEventId(), record.getVessel(),
                     record.getHolder(), record.getSpecies(), record.getSeason(), record.getWeight(),
-                    record.getRecordedAt().toString());
+                    record.getConfirmedWeight(), record.getStatus().name(), record.getVersion(),
+                    record.getReviewer(), record.getRecordedAt().toString(),
+                    record.getConfirmedAt() == null ? null : record.getConfirmedAt().toString(),
+                    record.getRejectedAt() == null ? null : record.getRejectedAt().toString());
         }
     }
 
@@ -53,9 +63,26 @@ public class LandingController {
         return ResponseEntity.status(HttpStatus.CREATED).body(LandingResponse.from(record));
     }
 
+    @PostMapping("/{eventId}/confirm")
+    public LandingResponse confirm(@PathVariable String eventId, @Valid @RequestBody ReviewRequest request) {
+        return LandingResponse.from(
+                landingService.confirm(eventId, request.reviewEventId(), request.reviewer()));
+    }
+
+    @PostMapping("/{eventId}/reject")
+    public LandingResponse reject(@PathVariable String eventId, @Valid @RequestBody ReviewRequest request) {
+        return LandingResponse.from(
+                landingService.reject(eventId, request.reviewEventId(), request.reviewer()));
+    }
+
     @GetMapping("/{eventId}")
     public LandingResponse get(@PathVariable String eventId) {
         return LandingResponse.from(landingService.getByEventId(eventId));
+    }
+
+    @GetMapping("/{eventId}/chain")
+    public LandingService.VersionChain chain(@PathVariable String eventId) {
+        return landingService.getVersionChain(eventId);
     }
 
     @GetMapping

@@ -8,5 +8,7 @@ public interface LedgerEventRepository extends JpaRepository<LedgerEvent, Long> 
 
     List<LedgerEvent> findByAccountIdOrderByIdAsc(Long accountId);
 
+    List<LedgerEvent> findByAccountIdAndReferenceOrderByIdAsc(Long accountId, String reference);
+
     long countByAccountIdAndType(Long accountId, LedgerEventType type);
 }

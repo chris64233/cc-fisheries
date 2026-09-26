@@ -7,6 +7,9 @@ import java.util.List;
 
 import com.chris64233.cc.fisheries.common.BusinessException;
 import com.chris64233.cc.fisheries.common.Quantities;
+import com.chris64233.cc.fisheries.hold.HoldType;
+import com.chris64233.cc.fisheries.hold.QuotaHold;
+import com.chris64233.cc.fisheries.hold.QuotaHoldRepository;
 import com.chris64233.cc.fisheries.quota.LedgerEvent;
 import com.chris64233.cc.fisheries.quota.LedgerEventRepository;
 import com.chris64233.cc.fisheries.quota.LedgerEventType;
@@ -31,15 +34,18 @@ public class TransferService {
     private final TransferRepository transferRepository;
     private final QuotaAccountRepository accountRepository;
     private final LedgerEventRepository ledgerRepository;
+    private final QuotaHoldRepository holdRepository;
     private final ObjectProvider<TransferService> selfProvider;
 
     public TransferService(TransferRepository transferRepository,
                            QuotaAccountRepository accountRepository,
                            LedgerEventRepository ledgerRepository,
+                           QuotaHoldRepository holdRepository,
                            ObjectProvider<TransferService> selfProvider) {
         this.transferRepository = transferRepository;
         this.accountRepository = accountRepository;
         this.ledgerRepository = ledgerRepository;
+        this.holdRepository = holdRepository;
         this.selfProvider = selfProvider;
     }
 
@@ -59,8 +65,9 @@ public class TransferService {
         Transfer transfer = transferRepository.save(new Transfer(
                 season, species, fromHolder, toHolder, amount,
                 Instant.now().plus(ttl == null ? DEFAULT_TTL : ttl)));
-        ledgerRepository.save(new LedgerEvent(from, LedgerEventType.TRANSFER_FREEZE, amount,
-                transfer.getId().toString()));
+        String reference = transfer.getId().toString();
+        ledgerRepository.save(new LedgerEvent(from, LedgerEventType.TRANSFER_FREEZE, amount, reference));
+        holdRepository.save(new QuotaHold(from, HoldType.TRANSFER, reference, amount));
         return transfer;
     }
 
@@ -95,6 +102,7 @@ public class TransferService {
         assertConsistent(to);
         transfer.markAccepted();
         String reference = transfer.getId().toString();
+        holdFor(reference).markSettled();
         ledgerRepository.save(new LedgerEvent(from, LedgerEventType.TRANSFER_OUT, transfer.getQuantity(), reference));
         ledgerRepository.save(new LedgerEvent(to, LedgerEventType.TRANSFER_IN, transfer.getQuantity(), reference));
         return transfer;
@@ -172,8 +180,15 @@ public class TransferService {
         QuotaAccount from = lockAccount(transfer.getSeason(), transfer.getSpecies(), transfer.getFromHolder());
         from.releaseFrozen(transfer.getQuantity());
         assertConsistent(from);
+        String reference = transfer.getId().toString();
+        holdFor(reference).markReleased();
         ledgerRepository.save(new LedgerEvent(from, LedgerEventType.TRANSFER_RELEASE,
-                transfer.getQuantity(), transfer.getId().toString()));
+                transfer.getQuantity(), reference));
+    }
+
+    private QuotaHold holdFor(String reference) {
+        return holdRepository.findByHoldTypeAndReferenceId(HoldType.TRANSFER, reference)
+                .orElseThrow(() -> BusinessException.notFound("转让冻结明细不存在: " + reference));
     }
 
     private QuotaAccount lockAccount(String season, String species, String holder) {

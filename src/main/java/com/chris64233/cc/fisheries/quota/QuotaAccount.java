@@ -11,6 +11,7 @@ import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
 import jakarta.persistence.Table;
 import jakarta.persistence.UniqueConstraint;
+import jakarta.persistence.Version;
 
 /**
  * 配额账户：按捕捞季 + 物种 + 权利人唯一，分别维护可用、转让冻结、已核销数量。
@@ -41,6 +42,14 @@ public class QuotaAccount {
 
     @Column(nullable = false, precision = 19, scale = Quantities.SCALE)
     private BigDecimal consumed = Quantities.ZERO;
+
+    /**
+     * 乐观版本号：账户行每次更新递增。调用方在悲观锁内比对决策时看到的版本，
+     * 版本已变化说明依据过期，拒绝旧决定（见更正复核）。
+     */
+    @Version
+    @Column(nullable = false)
+    private long version;
 
     protected QuotaAccount() {
     }
@@ -102,9 +111,29 @@ public class QuotaAccount {
         this.frozen = this.frozen.subtract(quantity);
     }
 
+    /**
+     * 复核通过：持有的冻结量正式核销（冻结减少、已核销增加），总量不变。
+     */
+    public void settleFrozenToConsumed(BigDecimal quantity) {
+        this.frozen = this.frozen.subtract(quantity);
+        this.consumed = this.consumed.add(quantity);
+    }
+
     public void consume(BigDecimal quantity) {
         this.available = this.available.subtract(quantity);
         this.consumed = this.consumed.add(quantity);
+    }
+
+    /**
+     * 更正减重：把已核销中实际多核销的差额归还可用（已核销减少、可用增加），总量不变。
+     */
+    public void refundConsumed(BigDecimal quantity) {
+        this.consumed = this.consumed.subtract(quantity);
+        this.available = this.available.add(quantity);
+    }
+
+    public long getVersion() {
+        return version;
     }
 
     public boolean hasNegativeBalance() {
