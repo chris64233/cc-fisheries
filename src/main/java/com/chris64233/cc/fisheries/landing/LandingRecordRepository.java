@@ -1,5 +1,6 @@
 package com.chris64233.cc.fisheries.landing;
 
+import java.math.BigDecimal;
 import java.util.List;
 import java.util.Optional;
 
@@ -26,4 +27,16 @@ public interface LandingRecordRepository extends JpaRepository<LandingRecord, Lo
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("select l from LandingRecord l where l.eventId = :eventId")
     Optional<LandingRecord> findByEventIdForUpdate(@Param("eventId") String eventId);
+
+    /**
+     * 某账户已上岸（已确认/已更正，即已核销）的重量合计，按当前有效确认重量计。
+     * 这部分额度对应账户的 consumed 余额，不能再转让。
+     */
+    @Query("select coalesce(sum(l.confirmedWeight), 0) from LandingRecord l "
+            + "where l.season = :season and l.species = :species and l.holder = :holder "
+            + "and l.status in (com.chris64233.cc.fisheries.landing.LandingStatus.CONFIRMED, "
+            + "com.chris64233.cc.fisheries.landing.LandingStatus.CORRECTED)")
+    BigDecimal sumConfirmedWeight(@Param("season") String season,
+                                  @Param("species") String species,
+                                  @Param("holder") String holder);
 }

@@ -42,20 +42,44 @@ class ApiIntegrationTest {
         // 发起转让并冻结
         String transferBody = mockMvc.perform(post("/api/transfers").contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"season":"API-S1","species":"COD","fromHolder":"A","toHolder":"B","quantity":30}
+                                {"requestId":"API-REQ-1","season":"API-S1","species":"COD","fromHolder":"A","toHolder":"B","quantity":30}
                                 """))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.status").value("PENDING"))
+                .andExpect(jsonPath("$.requestId").value("API-REQ-1"))
                 .andReturn().getResponse().getContentAsString();
         long transferId = Long.parseLong(transferBody.replaceAll(".*\"id\":(\\d+).*", "$1"));
 
-        // 接受转让
-        mockMvc.perform(post("/api/transfers/{id}/accept", transferId))
+        // 相同外部请求号重放幂等：返回同一笔，不重复冻结
+        mockMvc.perform(post("/api/transfers").contentType(MediaType.APPLICATION_JSON).content("""
+                {"requestId":"API-REQ-1","season":"API-S1","species":"COD","fromHolder":"A","toHolder":"B","quantity":30}
+                """)).andExpect(status().isCreated())
+                .andExpect(jsonPath("$.id").value(transferId));
+        // 相同请求号不同内容冲突
+        mockMvc.perform(post("/api/transfers").contentType(MediaType.APPLICATION_JSON).content("""
+                {"requestId":"API-REQ-1","season":"API-S1","species":"COD","fromHolder":"A","toHolder":"B","quantity":31}
+                """)).andExpect(status().isConflict());
+
+        // 接受转让（外部请求号幂等）
+        mockMvc.perform(post("/api/transfers/{id}/accept", transferId)
+                        .contentType(MediaType.APPLICATION_JSON).content("""
+                                {"requestId":"API-ACC-1","reviewer":"B"}
+                                """))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.status").value("ACCEPTED"));
         // 重复接受冲突
-        mockMvc.perform(post("/api/transfers/{id}/accept", transferId))
+        mockMvc.perform(post("/api/transfers/{id}/accept", transferId)
+                        .contentType(MediaType.APPLICATION_JSON).content("""
+                                {"requestId":"API-ACC-2","reviewer":"B"}
+                                """))
                 .andExpect(status().isConflict());
+        // 相同接受请求号重放幂等
+        mockMvc.perform(post("/api/transfers/{id}/accept", transferId)
+                        .contentType(MediaType.APPLICATION_JSON).content("""
+                                {"requestId":"API-ACC-1","reviewer":"B"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("ACCEPTED"));
 
         // 卸港申报：先冻结、进入待复核
         String landing = """
@@ -184,6 +208,92 @@ class ApiIntegrationTest {
     }
 
     @Test
+    void availabilityDetailAndCancelFlow() throws Exception {
+        mockMvc.perform(post("/api/quota-accounts").contentType(MediaType.APPLICATION_JSON).content("""
+                {"season":"API-T1","species":"COD","holder":"A","initialQuantity":100}
+                """)).andExpect(status().isCreated());
+        mockMvc.perform(post("/api/quota-accounts").contentType(MediaType.APPLICATION_JSON).content("""
+                {"season":"API-T1","species":"COD","holder":"B","initialQuantity":5}
+                """)).andExpect(status().isCreated());
+
+        // 一笔待处理转让冻结 20
+        String body = mockMvc.perform(post("/api/transfers").contentType(MediaType.APPLICATION_JSON).content("""
+                {"requestId":"API-T1-REQ","season":"API-T1","species":"COD","fromHolder":"A","toHolder":"B","quantity":20}
+                """)).andExpect(status().isCreated()).andReturn().getResponse().getContentAsString();
+        long transferId = Long.parseLong(body.replaceAll(".*\"id\":(\\d+).*", "$1"));
+
+        // 待复核卸港占用 10，已上岸核销 30
+        mockMvc.perform(post("/api/landings").contentType(MediaType.APPLICATION_JSON).content("""
+                {"eventId":"API-T1-PEND","vessel":"V1","holder":"A","species":"COD","season":"API-T1","weight":10}
+                """)).andExpect(status().isCreated());
+        mockMvc.perform(post("/api/landings").contentType(MediaType.APPLICATION_JSON).content("""
+                {"eventId":"API-T1-DONE","vessel":"V1","holder":"A","species":"COD","season":"API-T1","weight":30}
+                """)).andExpect(status().isCreated());
+        mockMvc.perform(post("/api/landings/{eventId}/confirm", "API-T1-DONE")
+                        .contentType(MediaType.APPLICATION_JSON).content("""
+                                {"reviewEventId":"API-T1-DONE-REV","reviewer":"port-1"}
+                                """)).andExpect(status().isOk());
+
+        // 可转 40 / 冻结 30（转让 20 + 待复核 10）/ 已上岸 30
+        mockMvc.perform(get("/api/transfers/availability")
+                        .param("season", "API-T1").param("species", "COD").param("holder", "A"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.available").value(40))
+                .andExpect(jsonPath("$.frozen").value(30))
+                .andExpect(jsonPath("$.consumed").value(30))
+                .andExpect(jsonPath("$.landed").value(30))
+                .andExpect(jsonPath("$.reservedByTransfers").value(20))
+                .andExpect(jsonPath("$.reservedByPendingLanding").value(10))
+                .andExpect(jsonPath("$.available").value(40));
+
+        // 待处理转让详情：冻结前后余额 + 对应校验
+        mockMvc.perform(get("/api/transfers/{id}/detail", transferId))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.balancesCorrespond").value(true))
+                .andExpect(jsonPath("$.transfer.status").value("PENDING"))
+                .andExpect(jsonPath("$.from.before.available").value(100))
+                .andExpect(jsonPath("$.from.after.available").value(80))
+                .andExpect(jsonPath("$.from.after.frozen").value(20))
+                .andExpect(jsonPath("$.from.events", hasSize(1)))
+                .andExpect(jsonPath("$.from.events[0].type").value("TRANSFER_FREEZE"))
+                // 受让方账户已存在但尚未入账：事件为空、前后余额为空
+                .andExpect(jsonPath("$.to.holder").value("B"))
+                .andExpect(jsonPath("$.to.events", hasSize(0)))
+                .andExpect(jsonPath("$.to.before").value(org.hamcrest.Matchers.nullValue()))
+                .andExpect(jsonPath("$.to.after").value(org.hamcrest.Matchers.nullValue()));
+
+        // 非发起方不能取消
+        mockMvc.perform(post("/api/transfers/{id}/cancel", transferId)
+                        .contentType(MediaType.APPLICATION_JSON).content("""
+                                {"requestId":"API-T1-CAN-BAD","operator":"B"}
+                                """))
+                .andExpect(status().isUnprocessableEntity());
+        // 发起方取消，幂等
+        mockMvc.perform(post("/api/transfers/{id}/cancel", transferId)
+                        .contentType(MediaType.APPLICATION_JSON).content("""
+                                {"requestId":"API-T1-CAN","operator":"A"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("CANCELLED"));
+        mockMvc.perform(post("/api/transfers/{id}/cancel", transferId)
+                        .contentType(MediaType.APPLICATION_JSON).content("""
+                                {"requestId":"API-T1-CAN","operator":"A"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("CANCELLED"));
+
+        // 取消后详情：冻结已释放，双方仍对应
+        mockMvc.perform(get("/api/transfers/{id}/detail", transferId))
+                .andExpect(jsonPath("$.balancesCorrespond").value(true))
+                .andExpect(jsonPath("$.transfer.status").value("CANCELLED"))
+                .andExpect(jsonPath("$.from.after.available").value(60))
+                .andExpect(jsonPath("$.from.after.frozen").value(10))
+                .andExpect(jsonPath("$.from.after.consumed").value(30))
+                .andExpect(jsonPath("$.from.events", hasSize(2)))
+                .andExpect(jsonPath("$.from.events[1].type").value("TRANSFER_RELEASE"));
+    }
+
+    @Test
     void rejectReviewReleasesFrozen() throws Exception {
         mockMvc.perform(post("/api/quota-accounts").contentType(MediaType.APPLICATION_JSON).content("""
                 {"season":"API-R1","species":"COD","holder":"A","initialQuantity":50}
@@ -223,7 +333,10 @@ class ApiIntegrationTest {
         mockMvc.perform(get("/api/quota-accounts/{id}", 999999))
                 .andExpect(status().isNotFound());
         // 转让不存在
-        mockMvc.perform(post("/api/transfers/{id}/accept", 999999))
+        mockMvc.perform(post("/api/transfers/{id}/accept", 999999)
+                        .contentType(MediaType.APPLICATION_JSON).content("""
+                                {"requestId":"X","reviewer":"r"}
+                                """))
                 .andExpect(status().isNotFound());
         // 超精度数量
         mockMvc.perform(post("/api/quota-accounts").contentType(MediaType.APPLICATION_JSON).content("""

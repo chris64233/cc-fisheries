@@ -113,15 +113,15 @@ class ConcurrencyTest {
     void concurrentReleaseAndExpireReleaseOnlyOnce() throws Exception {
         QuotaAccount account = accountService.createAccount("C3", "COD", "A", new BigDecimal("50"));
         accountService.createAccount("C3", "COD", "B", new BigDecimal("1"));
-        Transfer transfer = transferService.initiate("C3", "COD", "A", "B", new BigDecimal("20"),
-                Duration.ofMillis(1));
+        Transfer transfer = transferService.initiate("REQ-C3", "C3", "COD", "A", "B",
+                new BigDecimal("20"), Duration.ofMillis(1));
         Thread.sleep(50);
 
         AtomicInteger releases = new AtomicInteger();
         runConcurrently(12, i -> {
             try {
                 if (i % 2 == 0) {
-                    transferService.reject(transfer.getId());
+                    transferService.reject(transfer.getId(), "REJ-C3-" + i, "B");
                     releases.incrementAndGet();
                 } else {
                     if (transferService.expireOne(transfer.getId())) {
@@ -149,7 +149,8 @@ class ConcurrencyTest {
         // A 初始 110：转让冻结 40、卸港待复核冻结 30、增重更正冻结 20，剩可用 20（确认基础卸港后）
         QuotaAccount a = accountService.createAccount("C4", "COD", "A", new BigDecimal("110"));
         QuotaAccount b = accountService.createAccount("C4", "COD", "B", new BigDecimal("0.001"));
-        Transfer transfer = transferService.initiate("C4", "COD", "A", "B", new BigDecimal("40"), null);
+        Transfer transfer = transferService.initiate("REQ-C4", "C4", "COD", "A", "B",
+                new BigDecimal("40"), null);
         landingService.declare("C4-LAND", "V1", "A", "COD", "C4", new BigDecimal("30"));
         // 先有一笔已核销申报 20，再挂一笔增重 +20 的待确认更正
         landingService.declare("C4-BASE", "V1", "A", "COD", "C4", new BigDecimal("20"));
@@ -160,7 +161,7 @@ class ConcurrencyTest {
         runConcurrently(3, i -> {
             try {
                 switch (i) {
-                    case 0 -> transferService.accept(transfer.getId());
+                    case 0 -> transferService.accept(transfer.getId(), "ACC-C4", "B");
                     case 1 -> landingService.confirm("C4-LAND", "C4-LAND-REV", "port-1");
                     default -> correctionService.confirm("C4-CORR", "C4-CORR-REV", "port-2");
                 }
@@ -206,13 +207,14 @@ class ConcurrencyTest {
     void concurrentAcceptAndDeclareCompeteForAvailableWithoutGoingNegative() throws Exception {
         QuotaAccount from = accountService.createAccount("C6", "COD", "A", new BigDecimal("100"));
         accountService.createAccount("C6", "COD", "B", new BigDecimal("0.001"));
-        Transfer transfer = transferService.initiate("C6", "COD", "A", "B", new BigDecimal("40"), null);
+        Transfer transfer = transferService.initiate("REQ-C6", "C6", "COD", "A", "B",
+                new BigDecimal("40"), null);
 
         AtomicInteger declared = new AtomicInteger();
         runConcurrently(11, i -> {
             try {
                 if (i == 0) {
-                    transferService.accept(transfer.getId());
+                    transferService.accept(transfer.getId(), "ACC-C6", "B");
                 } else {
                     landingService.declare("C6-EVT-" + i, "V" + i, "A", "COD", "C6", new BigDecimal("10"));
                     declared.incrementAndGet();
@@ -242,7 +244,7 @@ class ConcurrencyTest {
 
         runConcurrently(10, i -> {
             try {
-                transferService.initiate("C5", "COD", "A", "B", new BigDecimal("30"), null);
+                transferService.initiate("REQ-C5-" + i, "C5", "COD", "A", "B", new BigDecimal("30"), null);
                 succeeded.incrementAndGet();
             } catch (BusinessException expected) {
                 // 可用不足，冻结失败
@@ -255,6 +257,52 @@ class ConcurrencyTest {
         assertThat(after.getAvailable()).isEqualByComparingTo("10");
         assertThat(after.total()).isEqualByComparingTo("100");
         assertHeldHoldsEqualFrozen(account.getId());
+    }
+
+    @Test
+    void concurrentDuplicateInitiateFreezesOnlyOnce() throws Exception {
+        QuotaAccount account = accountService.createAccount("C7", "COD", "A", new BigDecimal("100"));
+        accountService.createAccount("C7", "COD", "B", new BigDecimal("1"));
+        AtomicInteger done = new AtomicInteger();
+        java.util.Set<Long> transferIds = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+        runConcurrently(12, i -> {
+            Transfer t = transferService.initiate("REQ-C7-DUP", "C7", "COD", "A", "B",
+                    new BigDecimal("30"), null);
+            transferIds.add(t.getId());
+            done.incrementAndGet();
+        });
+
+        // 所有重放返回同一笔转让，只冻结一次 30
+        assertThat(done.get()).isEqualTo(12);
+        assertThat(transferIds).hasSize(1);
+        QuotaAccount after = accountService.getAccount(account.getId());
+        assertThat(after.getFrozen()).isEqualByComparingTo("30");
+        assertThat(after.getAvailable()).isEqualByComparingTo("70");
+        assertThat(ledgerRepository.countByAccountIdAndType(account.getId(), LedgerEventType.TRANSFER_FREEZE))
+                .isEqualTo(1);
+    }
+
+    @Test
+    void concurrentDuplicateAcceptSettlesOnlyOnce() throws Exception {
+        QuotaAccount from = accountService.createAccount("C8", "COD", "A", new BigDecimal("100"));
+        QuotaAccount to = accountService.createAccount("C8", "COD", "B", new BigDecimal("5"));
+        Transfer transfer = transferService.initiate("REQ-C8", "C8", "COD", "A", "B",
+                new BigDecimal("40"), null);
+
+        runConcurrently(12, i -> transferService.accept(transfer.getId(), "ACC-C8-DUP", "B"));
+
+        QuotaAccount fromAfter = accountService.getAccount(from.getId());
+        QuotaAccount toAfter = accountService.getAccount(to.getId());
+        assertThat(fromAfter.getAvailable()).isEqualByComparingTo("60");
+        assertThat(fromAfter.getFrozen()).isEqualByComparingTo("0");
+        assertThat(toAfter.getAvailable()).isEqualByComparingTo("45");
+        assertThat(ledgerRepository.countByAccountIdAndType(from.getId(), LedgerEventType.TRANSFER_OUT))
+                .isEqualTo(1);
+        assertThat(ledgerRepository.countByAccountIdAndType(to.getId(), LedgerEventType.TRANSFER_IN))
+                .isEqualTo(1);
+        // 双方台账与转让单据相互对应
+        assertThat(transferService.getTransferView(transfer.getId()).balancesCorrespond()).isTrue();
     }
 
     private void assertHeldHoldsEqualFrozen(Long accountId) {
