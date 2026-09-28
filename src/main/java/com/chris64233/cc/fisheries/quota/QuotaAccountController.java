@@ -4,6 +4,7 @@ import java.math.BigDecimal;
 import java.util.List;
 
 import com.chris64233.cc.fisheries.hold.QuotaHold;
+import com.chris64233.cc.fisheries.transfer.TransferService;
 
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
@@ -24,9 +25,11 @@ import org.springframework.web.bind.annotation.RestController;
 public class QuotaAccountController {
 
     private final QuotaAccountService accountService;
+    private final TransferService transferService;
 
-    public QuotaAccountController(QuotaAccountService accountService) {
+    public QuotaAccountController(QuotaAccountService accountService, TransferService transferService) {
         this.accountService = accountService;
+        this.transferService = transferService;
     }
 
     public record CreateAccountRequest(
@@ -97,5 +100,19 @@ public class QuotaAccountController {
     public List<HoldResponse> holds(@PathVariable Long id,
                                     @RequestParam(required = false) Boolean activeOnly) {
         return accountService.getHolds(id, activeOnly).stream().map(HoldResponse::from).toList();
+    }
+
+    /**
+     * 可转余额分解：区分可转余额（available/transferable）、已上岸（consumed/landed）
+     * 与被其他申请暂时占用的冻结量（转让 / 卸港待复核 / 更正待复核）。
+     * 查看某笔在途转让时传 {@code excludeTransferId}，把该笔自身冻结算回可转量。
+     */
+    @GetMapping("/transfer-availability")
+    public TransferService.AvailabilityView transferAvailability(
+            @RequestParam String season,
+            @RequestParam String species,
+            @RequestParam String holder,
+            @RequestParam(required = false) Long excludeTransferId) {
+        return transferService.getAvailability(season, species, holder, excludeTransferId);
     }
 }

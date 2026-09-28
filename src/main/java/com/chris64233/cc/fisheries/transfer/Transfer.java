@@ -128,6 +128,12 @@ public class Transfer {
         this.resolvedAt = Instant.now();
     }
 
+    /** 转让方主动取消：仅在待接收状态下允许，冻结量由服务层释放。 */
+    public void markCancelled() {
+        this.status = TransferStatus.CANCELLED;
+        this.resolvedAt = Instant.now();
+    }
+
     public void markExpired() {
         this.status = TransferStatus.EXPIRED;
         this.resolvedAt = Instant.now();

@@ -235,8 +235,51 @@ class ConcurrencyTest {
     }
 
     @Test
-    void concurrentInitiateNeverOverFreezes() throws Exception {
-        QuotaAccount account = accountService.createAccount("C5", "COD", "A", new BigDecimal("100"));
+    void concurrentDuplicateInitiateWithSameRequestIdFreezesOnce() throws Exception {
+        QuotaAccount account = accountService.createAccount("C7", "COD", "A", new BigDecimal("100"));
+        accountService.createAccount("C7", "COD", "B", new BigDecimal("1"));
+        java.util.Set<Long> createdIds = java.util.Collections.synchronizedSet(new java.util.HashSet<>());
+
+        runConcurrently(12, i -> {
+            Transfer t = transferService.initiate("C7-REQ", "C7", "COD", "A", "B",
+                    new BigDecimal("40"), null);
+            createdIds.add(t.getId());
+        });
+
+        // 所有重放返回同一转让单，只冻结一次
+        assertThat(createdIds).hasSize(1);
+        QuotaAccount after = accountService.getAccount(account.getId());
+        assertThat(after.getFrozen()).isEqualByComparingTo("40");
+        assertThat(after.getAvailable()).isEqualByComparingTo("60");
+        assertThat(ledgerRepository.countByAccountIdAndType(account.getId(), LedgerEventType.TRANSFER_FREEZE))
+                .isEqualTo(1);
+        assertHeldHoldsEqualFrozen(account.getId());
+    }
+
+    @Test
+    void concurrentAcceptWithSameRequestIdMovesOnce() throws Exception {
+        QuotaAccount from = accountService.createAccount("C8", "COD", "A", new BigDecimal("100"));
+        QuotaAccount to = accountService.createAccount("C8", "COD", "B", new BigDecimal("2"));
+        Transfer transfer = transferService.initiate("C8-REQ-NEW", "C8", "COD", "A", "B",
+                new BigDecimal("40"), null);
+
+        runConcurrently(12, i -> transferService.accept(transfer.getId(), "C8-ACC-REQ"));
+
+        QuotaAccount fromAfter = accountService.getAccount(from.getId());
+        QuotaAccount toAfter = accountService.getAccount(to.getId());
+        assertThat(transferService.getTransfer(transfer.getId()).getStatus())
+                .isEqualTo(TransferStatus.ACCEPTED);
+        assertThat(fromAfter.getFrozen()).isEqualByComparingTo("0");
+        assertThat(fromAfter.getAvailable()).isEqualByComparingTo("60");
+        assertThat(toAfter.getAvailable()).isEqualByComparingTo("42");
+        assertThat(ledgerRepository.countByAccountIdAndType(from.getId(), LedgerEventType.TRANSFER_OUT))
+                .isEqualTo(1);
+        assertThat(ledgerRepository.countByAccountIdAndType(to.getId(), LedgerEventType.TRANSFER_IN))
+                .isEqualTo(1);
+    }
+
+    @Test
+    void concurrentInitiateNeverOverFreezes() throws Exception {        QuotaAccount account = accountService.createAccount("C5", "COD", "A", new BigDecimal("100"));
         accountService.createAccount("C5", "COD", "B", new BigDecimal("1"));
         AtomicInteger succeeded = new AtomicInteger();
 
